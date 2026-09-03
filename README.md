@@ -1,8 +1,8 @@
 # argo-plugins
 
 Claude Code plugins that came out of building Argo, a personal executive-function
-assistant. Each one is something that had to work reliably for months before it was
-packaged.
+assistant. Each one is something we built for ourselves first, used daily, and only
+then packaged.
 
 ```
 /plugin marketplace add ragonc/argo-plugins

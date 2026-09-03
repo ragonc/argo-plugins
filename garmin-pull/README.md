@@ -82,7 +82,7 @@ functions against captured response shapes, so neither test needs a Garmin accou
 
 ## Lessons baked in
 
-This came out of running a personal daily Garmin pull for months. The parts that
-bit us and are now built in: cache the session or get throttled; stop at the first
+This came out of building a personal daily Garmin pull and living with it for a
+few weeks. The parts that bit us and are now built in: cache the session or get throttled; stop at the first
 429 instead of retrying into a longer ban; checkpoint per day so a stop costs
 nothing; never fill a gap with a guess; keep the password in one readable file.
