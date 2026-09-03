@@ -39,11 +39,12 @@ the rest in one short message with defaults offered:
 ## Step 1: check setup
 
 ```
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_setup.py --check
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_doctor.py
 ```
 
-If it says "not set up" or "login failed", tell them to run this **themselves, in their
-own terminal window**, because it asks for their Garmin email and password privately:
+It prints OK / WARN / FAIL lines with the fix for each. If credentials are missing or
+the login failed, tell them to run this **themselves, in their own terminal window**,
+because it asks for their Garmin email and password privately:
 
 ```
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_setup.py
@@ -51,7 +52,7 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_setup.py
 
 Explain in one line what it does: stores the login on their computer only, readable
 only by them, logs in once, and may ask for a two-factor code that Garmin emails them.
-Wait until they say it worked, then run `--check` again. Do not try to run the setup
+Wait until they say it worked, then run the doctor again. Do not try to run the setup
 for them and do not ask them to paste the password into the chat.
 
 ## Step 2: pull
@@ -75,11 +76,15 @@ and that rerunning the same command an hour later continues from there.
 
 ## Step 3: report
 
-Read the last lines of the script's output and tell them, in a few sentences:
+The script ends with a "Garmin pull report" block (also saved as `report.txt`). Relay it
+in a few sentences, in their words:
 - what was pulled (days and categories) and where the files are
 - the three files most people want: the CSVs, `garmin.db`, and `raw/` for JSON; with
   `--full-day`, point at `timeline.csv` (one row per measurement, `series` says which)
-- any days that failed and why (the script records them, it never fills gaps)
+- days with errors or no data, as listed (the script records them, it never fills gaps)
+- if the report says Garmin changed something: the data is still complete in `raw/`,
+  new fields appear under generated names, and nothing needs doing unless a column
+  they care about went missing
 
 If the run stopped with a rate-limit message (exit code 3), say plainly that Garmin
 throttled the connection, nothing is lost, and rerunning the same command in about an
@@ -100,9 +105,10 @@ feature is not on their device. Say that rather than guessing.
   run the setup script again in their terminal.
 - **HTTP 429**: throttled, see above. Repeated full logins cause it, which is why the
   session is cached; never add `--no-cache` to work around a problem.
-- **A field is always empty**: Garmin renamed or dropped it. The shaping functions in
-  `garmin_client.py` map field names; read the raw JSON for that day to see what is
-  actually there before changing anything.
+- **A field is always empty**: check the report's drift section first. Summary columns
+  are mapped in `garmin_client.py`; detail is flattened generically from the raw JSON
+  under `raw/detail/<day>/`, so read that to see what Garmin actually sent.
+- **Anything odd**: `garmin_doctor.py` first, then the report, then the raw JSON.
 - **Wrong Python**: the scripts need 3.11+. `python3 --version` tells them.
 
 ## Never

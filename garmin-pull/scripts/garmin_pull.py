@@ -294,7 +294,7 @@ def write_sqlite(db_path: Path, tables: dict[str, tuple[str | tuple[str, ...], l
     db.close()
 
 
-def write_outputs(out: Path, only: set[str], formats: set[str], activities: list[dict] | None) -> None:
+def write_outputs(out: Path, only: set[str], formats: set[str], activities: list[dict] | None) -> tuple[dict, dict]:
     days = load_all_days(out / "raw")
     tables: dict[str, tuple[str, list[dict]]] = {}
     for category in DAILY:
@@ -304,8 +304,9 @@ def write_outputs(out: Path, only: set[str], formats: set[str], activities: list
         tables["activities"] = ("activity_id", activities)
     elif "activities" in only and (out / "raw" / "activities.json").exists():
         tables["activities"] = ("activity_id", json.loads((out / "raw" / "activities.json").read_text()))
+    drift: dict = {}
     if "detail" in only:
-        timeline, snapshots = garmin_detail.detail_tables(out / "raw" / "detail")
+        timeline, snapshots, drift = garmin_detail.detail_tables(out / "raw" / "detail")
         tables["timeline"] = (("date", "series", "time_gmt"), timeline)
         tables["snapshots"] = (("date", "metric"), snapshots)
     if "csv" in formats:
@@ -315,6 +316,61 @@ def write_outputs(out: Path, only: set[str], formats: set[str], activities: list
         write_sqlite(out / "garmin.db", tables)
     counts = ", ".join(f"{name} {len(rows)}" for name, (_, rows) in tables.items())
     log(f"garmin: wrote {', '.join(sorted(formats))} to {out} ({counts})")
+    return tables, drift
+
+
+def report(out: Path, only: set[str], days: list[str], tables: dict, drift: dict, rate_limited: bool) -> str:
+    """The plain-words summary printed after every pull: what came in, what is
+    missing, and anything Garmin changed. Also saved as report.txt."""
+    raw_dir = out / "raw"
+    lines = ["", "=== Garmin pull report ==="]
+    daily = only & set(DAILY)
+    if days:
+        on_disk = [d for d in days if (raw_dir / f"{d}.json").exists()]
+        errors = [d for d in on_disk if "error" in (_read_day(raw_dir / f"{d}.json") or {})]
+        gaps = [d for d in days if d not in on_disk]
+        lines.append(f"days: {days[0]} .. {days[-1]}: {len(on_disk) - len(errors)} complete, "
+                     f"{len(errors)} with errors, {len(gaps)} not fetched")
+        if errors:
+            lines.append("  errors on: " + ", ".join(errors[:10]) + (" ..." if len(errors) > 10 else ""))
+        if daily:
+            empty = {c: 0 for c in sorted(daily)}
+            for d in on_disk:
+                data = _read_day(raw_dir / f"{d}.json") or {}
+                for c in daily:
+                    if c in data and not data[c]:
+                        empty[c] += 1
+            blank = [f"{c} ({n} day{'s' if n != 1 else ''})" for c, n in empty.items() if n]
+            if blank:
+                lines.append("  no data from Garmin for: " + ", ".join(blank))
+        if "detail" in only:
+            incomplete = [d for d in days if not garmin_detail.detail_complete(raw_dir / "detail" / d)]
+            if incomplete:
+                lines.append(f"  detail incomplete on {len(incomplete)} day(s): " + ", ".join(incomplete[:8]))
+    for name, (_, rows) in tables.items():
+        if name == "timeline":
+            series: dict[str, int] = {}
+            for row in rows:
+                series[row["series"]] = series.get(row["series"], 0) + 1
+            lines.append(f"timeline: {len(rows)} measurements in {len(series)} series")
+            for s_name, n in sorted(series.items()):
+                lines.append(f"  {s_name}: {n}")
+        else:
+            lines.append(f"{name}: {len(rows)} rows")
+    if drift:
+        lines.append("Garmin changed something (raw JSON still has everything, generic flattening applied):")
+        for endpoint, change in drift.items():
+            if change.get("added"):
+                lines.append(f"  {endpoint}: new fields " + ", ".join(change["added"][:8]))
+            if change.get("missing"):
+                lines.append(f"  {endpoint}: fields gone " + ", ".join(change["missing"][:8]))
+    files = sorted(p.name for p in out.iterdir() if p.is_file())
+    lines.append("files: " + ", ".join(files))
+    if rate_limited:
+        lines.append("STOPPED EARLY: Garmin rate-limited the connection. Rerun the same command in about an hour.")
+    text = "\n".join(lines)
+    (out / "report.txt").write_text(text.strip() + "\n")
+    return text
 
 
 # --- CLI -----------------------------------------------------------------------
@@ -447,11 +503,10 @@ def main() -> int:
             save_session(session)
         except OSError:
             pass
-    write_outputs(args.out, only, formats, activities)
+    tables, drift = write_outputs(args.out, only, formats, activities)
+    log(report(args.out, only, days, tables, drift, rate_limited))
     if rate_limited:
-        log("garmin: stopped early because Garmin rate-limited us. Rerun the same command in about an hour; it continues from here.")
         return 3
-    log("garmin: done")
     return 0
 
 

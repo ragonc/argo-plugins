@@ -8,7 +8,7 @@
       "name": "garmin-pull",
       "source": "./garmin-pull",
       "description": "Pull your own Garmin Connect wellness and activity data into CSV, SQLite and JSON, with guided setup and partial-data selection.",
-      "version": "0.3.0"
+      "version": "0.4.0"
     }
   ],
   "description": "Plugins that came out of building Argo, a personal executive-function assistant: tools we built for ourselves, used daily, then packaged."

@@ -41,6 +41,7 @@ python3 scripts/garmin_pull.py --all-history        # from your first Garmin act
 | `--out FOLDER` | where to write (default `./garmin-data`) |
 | `--format` | `csv`, `sqlite` or both (default both; raw JSON is always written) |
 | `--refresh` | re-pull days already on disk |
+| `--yes` | skip the confirmation for long pulls |
 
 Before a pull the script prints the range, the categories, and roughly how long it
 will take. Anything over about 15 minutes asks for a yes first (`--yes` skips that).
@@ -59,6 +60,32 @@ Two extra files appear: `timeline.csv` (date, series, time_gmt, value, value2, o
 per measurement) and `snapshots.csv` (date, metric, value). Both are tables in
 `garmin.db` too. The untouched Garmin responses are kept under `raw/detail/<day>/`,
 one JSON per endpoint, so anything the flattening does not cover is still there.
+
+The flattening adapts rather than assuming. Garmin ships a descriptor list next to
+every array saying which column is the timestamp and what the others are; the
+flattener reads those, so a reordered or extended array still lands in the right
+columns. Any list with a time field becomes a series, any scalar becomes a snapshot
+metric, and unknown fields get a generated name instead of being dropped. A shipped
+`schema_baseline.json` records the field names seen when this was built; every pull
+compares and the report says what Garmin added or removed, so you hear about a
+change from the report rather than from an empty column.
+
+### After every pull: the report
+
+The last thing printed, also saved as `report.txt`: days complete, days with errors,
+days Garmin had no data for, timeline series with row counts, files written, and any
+schema drift. If the run was cut short by rate limiting it says so and what to do.
+
+### Something not working? The doctor
+
+```
+python3 scripts/garmin_doctor.py            # checks, then one small request to Garmin
+python3 scripts/garmin_doctor.py --offline  # no network
+```
+
+Python version, credentials, cached session and its age, the state of a previous
+pull, and one request to prove the session works. Each line says OK, WARN or FAIL
+and what to do.
 
 ### All of your history
 
