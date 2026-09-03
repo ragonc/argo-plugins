@@ -2,29 +2,36 @@
 """garmin_pull.py -- pull your Garmin wellness and activity data into files you
 can actually use: one JSON per day, one CSV per category, one SQLite database.
 
-    python3 garmin_pull.py                              # last 30 days, everything
+    python3 garmin_pull.py                              # last 30 days, daily summaries of everything
     python3 garmin_pull.py --last 90d --what sleep,hrv
     python3 garmin_pull.py --since 2026-01-01 --until 2026-03-31 --what activities --workout-files
-    python3 garmin_pull.py --everything                 # full drop: all data since your first activity
+    python3 garmin_pull.py --full-day --last 7d         # every data point the watch stored, per day
+    python3 garmin_pull.py --all-history                # from your first Garmin activity to today
     python3 garmin_pull.py --out ~/garmin-data --format csv
 
-What (--what, comma-separated; default all):
+What (--what, comma-separated; default all = the five daily summaries):
     sleep       stages, score, efficiency, SpO2 and respiration during sleep, sleep need
     hrv         last-night HRV, weekly average, personal baseline, status
     summary     resting HR, stress, body battery, steps, SpO2, intensity minutes, calories
     vo2max      VO2max estimate for the day, when Garmin published one
     activities  workouts with distance, duration, HR, power, training effect
+    detail      every intraday data point: heart rate, stress, body battery, steps per 15 min,
+                breathing, SpO2, HRV readings, sleep stages and movement, plus that day's
+                training readiness, hydration, training status, endurance score, fitness age
+    --full-day  shorthand for all five + detail + workout files
 
 When: --last 30d | 12w | 6m | 2y   (default 30d)
       --since YYYY-MM-DD [--until YYYY-MM-DD]
-      --everything   all categories + workout files, from your first Garmin activity to today
+      --all-history   from your first Garmin activity to today
 
 Output folder layout (default ./garmin-data):
-    raw/YYYY-MM-DD.json     shaped data for that day (the resume checkpoint)
-    raw/activities.json     shaped activity list for the range
-    tcx/<activity_id>.tcx   only with --workout-files
+    raw/YYYY-MM-DD.json           shaped daily data (the resume checkpoint)
+    raw/activities.json           shaped activity list for the range
+    raw/detail/YYYY-MM-DD/*.json  untouched Garmin responses, one per endpoint (detail)
+    tcx/<activity_id>.tcx         only with --workout-files
     sleep.csv hrv.csv summary.csv vo2max.csv activities.csv
-    garmin.db               SQLite, one table per category, primary key on date / activity_id
+    timeline.csv snapshots.csv    detail, flattened: every timestamped value / every daily metric
+    garmin.db                     SQLite, one table per file above
 
 Resumable: a day whose raw JSON already exists is skipped (use --refresh to re-pull).
 Rate limits: Garmin answers HTTP 429 when asked too fast or logged into too often.
@@ -44,6 +51,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import garmin_detail  # noqa: E402
 from garmin_client import (  # noqa: E402
     GarminConnectError,
     GarminSession,
@@ -56,7 +64,8 @@ from garmin_client import (  # noqa: E402
     shape_vo2max,
 )
 
-CATEGORIES = ("sleep", "hrv", "summary", "vo2max", "activities")
+CATEGORIES = ("sleep", "hrv", "summary", "vo2max", "activities", "detail")
+SUMMARIES = ("sleep", "hrv", "summary", "vo2max", "activities")
 DAILY = ("sleep", "hrv", "summary", "vo2max")
 
 
@@ -148,28 +157,39 @@ def pull_days(session: GarminSession, days: list[str], only: set[str], raw_dir: 
               pause: float, refresh: bool) -> tuple[int, int, bool]:
     """Returns (pulled, skipped, rate_limited)."""
     pulled = skipped = 0
+    daily = only & set(DAILY)
+    want_detail = "detail" in only
     for i, day in enumerate(days):
         target = raw_dir / f"{day}.json"
         existing = _read_day(target) if target.exists() and not refresh else None
-        missing = set(only) if existing is None or "error" in existing else {c for c in only if c not in existing}
-        if not missing:
+        missing = set(daily) if existing is None or "error" in existing else {c for c in daily if c not in existing}
+        detail_dir = raw_dir / "detail" / day
+        need_detail = want_detail and (refresh or not garmin_detail.detail_complete(detail_dir))
+        if not missing and not need_detail:
             skipped += 1
             continue
         if pulled and pause:
             time.sleep(pause)
         try:
-            result = {**(existing or {}), **fetch_day(session, day, missing)}
-            result.pop("error", None)
+            if missing:
+                result = {**(existing or {}), **fetch_day(session, day, missing)}
+                result.pop("error", None)
+                target.write_text(json.dumps(result, indent=2) + "\n")
+            if need_detail:
+                status = garmin_detail.fetch_detail(session, day, detail_dir)
+                failed = [k for k, v in status.items() if str(v).startswith("error")]
+                if failed:
+                    log(f"garmin: {day} detail: {len(failed)} endpoint(s) failed ({', '.join(failed)})")
         except GarminConnectError as exc:
             if "429" in str(exc):
                 log(f"garmin: HTTP 429 (rate limited) at {day} after {pulled} day(s). "
                     f"Wait an hour or so and rerun -- it resumes from here.")
                 return pulled, skipped, True
             log(f"garmin: {day} failed ({exc}) -- recorded, continuing")
-            result = {"date": day, "error": str(exc)[:300]}
-        target.write_text(json.dumps(result, indent=2) + "\n")
+            target.write_text(json.dumps({"date": day, "error": str(exc)[:300]}, indent=2) + "\n")
         pulled += 1
-        log(f"garmin: {day} ok ({i + 1}/{len(days)})" + (f", added {', '.join(sorted(missing))}" if existing else ""))
+        added = sorted(missing) + (["detail"] if need_detail else [])
+        log(f"garmin: {day} ok ({i + 1}/{len(days)})" + (f", added {', '.join(added)}" if existing else ""))
     return pulled, skipped, False
 
 
@@ -245,19 +265,20 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def write_sqlite(db_path: Path, tables: dict[str, tuple[str, list[dict]]]) -> None:
-    """tables = {name: (primary_key_column, rows)}. Columns are created from
-    the rows; every value is stored as it comes (numbers stay numbers)."""
+def write_sqlite(db_path: Path, tables: dict[str, tuple[str | tuple[str, ...], list[dict]]]) -> None:
+    """tables = {name: (primary_key, rows)}; the key is a column name or a tuple
+    of them. Columns are created from the rows; values are stored as they come."""
     db = sqlite3.connect(db_path)
     for name, (pk, rows) in tables.items():
         if not rows:
             continue
+        pk_cols = (pk,) if isinstance(pk, str) else tuple(pk)
         columns: list[str] = []
         for row in rows:
             for key in row:
                 if key not in columns:
                     columns.append(key)
-        defs = ", ".join(f'"{c}"' + (" PRIMARY KEY" if c == pk else "") for c in columns)
+        defs = ", ".join(f'"{c}"' for c in columns) + ", PRIMARY KEY (" + ", ".join(f'"{c}"' for c in pk_cols) + ")"
         db.execute(f'CREATE TABLE IF NOT EXISTS "{name}" ({defs})')
         existing = {r[1] for r in db.execute(f'PRAGMA table_info("{name}")')}
         for c in columns:
@@ -283,6 +304,10 @@ def write_outputs(out: Path, only: set[str], formats: set[str], activities: list
         tables["activities"] = ("activity_id", activities)
     elif "activities" in only and (out / "raw" / "activities.json").exists():
         tables["activities"] = ("activity_id", json.loads((out / "raw" / "activities.json").read_text()))
+    if "detail" in only:
+        timeline, snapshots = garmin_detail.detail_tables(out / "raw" / "detail")
+        tables["timeline"] = (("date", "series", "time_gmt"), timeline)
+        tables["snapshots"] = (("date", "metric"), snapshots)
     if "csv" in formats:
         for name, (_, rows) in tables.items():
             write_csv(out / f"{name}.csv", rows)
@@ -298,15 +323,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     what = parser.add_argument_group("what to pull")
     what.add_argument("--what", default="all", metavar="LIST",
-                      help="'all' or a comma list of: " + ", ".join(CATEGORIES) + " (default all)")
+                      help="'all' (the five daily summaries) or a comma list of: " + ", ".join(CATEGORIES))
+    what.add_argument("--full-day", action="store_true",
+                      help="every data point the watch stored each day: all summaries + detail + workout files")
     what.add_argument("--workout-files", action="store_true",
                       help="also save each workout's TCX file (per-second heart rate, pace, GPS)")
-    what.add_argument("--everything", action="store_true",
-                      help="full drop: all categories, workout files, from your first activity to today")
     when = parser.add_argument_group("when")
     when.add_argument("--last", default=None, metavar="PERIOD", help="30d, 12w, 6m, 2y ... (default 30d)")
     when.add_argument("--since", metavar="DATE", help="YYYY-MM-DD, first day to pull")
     when.add_argument("--until", metavar="DATE", help="YYYY-MM-DD, last day to pull (default today)")
+    when.add_argument("--all-history", action="store_true",
+                      help="from your first Garmin activity to today (long; stops and resumes on rate limits)")
     where = parser.add_argument_group("where")
     where.add_argument("--out", type=Path, default=Path("garmin-data"), metavar="FOLDER",
                        help="output folder (default ./garmin-data)")
@@ -326,16 +353,16 @@ def main() -> int:
     parser.add_argument("--tcx", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    what_arg = args.what_alias or args.what
-    only = set(CATEGORIES) if args.everything or what_arg.strip().lower() == "all" else {
-        c.strip().lower() for c in what_arg.split(",") if c.strip()
-    }
+    what_arg = (args.what_alias or args.what).strip().lower()
+    only = set(SUMMARIES) if what_arg == "all" else {c.strip() for c in what_arg.split(",") if c.strip()}
+    if args.full_day:
+        only = set(CATEGORIES)
     unknown = only - set(CATEGORIES)
     if unknown:
         log(f"garmin: unknown category {', '.join(sorted(unknown))}; choose from {', '.join(CATEGORIES)} or all")
         return 2
     formats = {f.strip() for f in args.format.split(",") if f.strip()} | {"json"}
-    want_tcx = args.workout_files or args.tcx or args.everything
+    want_tcx = args.workout_files or args.tcx or args.full_day
 
     try:
         session = open_session(mfa_code=args.mfa_code, use_cache=not args.no_cache, log=log)
@@ -347,7 +374,7 @@ def main() -> int:
     until_arg = args.until or args.until_alias
     end = date.fromisoformat(until_arg) if until_arg else today
     since_arg = args.since or args.since_alias
-    if args.everything and not since_arg:
+    if args.all_history and not since_arg:
         log("garmin: finding your first activity to know how far back to go ...")
         first = find_first_activity_date(session)
         if first is None:
@@ -369,16 +396,21 @@ def main() -> int:
         return 2
 
     daily = only & set(DAILY)
-    days = day_range(start, end) if daily else []
+    per_day = only & (set(DAILY) | {"detail"})
+    days = day_range(start, end) if per_day else []
     raw_dir = args.out / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
+
     def _needs(d: str) -> bool:
         if args.refresh:
             return True
         existing = _read_day(raw_dir / f"{d}.json") if (raw_dir / f"{d}.json").exists() else None
-        return existing is None or "error" in existing or any(c not in existing for c in daily)
+        summaries_missing = existing is None or "error" in existing or any(c not in existing for c in daily)
+        detail_missing = "detail" in only and not garmin_detail.detail_complete(raw_dir / "detail" / d)
+        return summaries_missing or detail_missing
     todo = [d for d in days if _needs(d)]
-    minutes = estimate_minutes(len(todo), len(daily), args.pause)
+    weight = len(daily) + (garmin_detail.REQUESTS_PER_DAY if "detail" in only else 0)
+    minutes = estimate_minutes(len(todo), weight, args.pause)
     log(f"garmin: {start} .. {end}, {', '.join(sorted(only))}"
         + (", with workout files" if want_tcx else "")
         + f" -> {args.out}")
@@ -399,8 +431,8 @@ def main() -> int:
         tcx_dir.mkdir(parents=True, exist_ok=True)
 
     rate_limited = False
-    if daily:
-        pulled, skipped, rate_limited = pull_days(session, days, daily, raw_dir, args.pause, args.refresh)
+    if per_day:
+        pulled, skipped, rate_limited = pull_days(session, days, per_day, raw_dir, args.pause, args.refresh)
         log(f"garmin: {pulled} pulled, {skipped} already present")
     activities = None
     if "activities" in only and not rate_limited:

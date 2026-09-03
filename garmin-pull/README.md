@@ -1,9 +1,10 @@
 # garmin-pull
 
 Get your own Garmin Connect data out of the app and into files: sleep, HRV, resting
-heart rate, stress, body battery, steps, VO2max and every workout. One CSV per
-category, one SQLite database, and the raw JSON per day. Pick only the categories and
-the date range you want.
+heart rate, stress, body battery, steps, VO2max and every workout, as daily summaries
+or as every single data point the watch recorded during the day. One CSV per
+category, one SQLite database, and the raw JSON. Pick only the categories and the
+date range you want.
 
 Pure Python standard library, 3.11 or newer. Nothing to install. Talks only to
 `sso.garmin.com` and `connectapi.garmin.com`.
@@ -22,18 +23,20 @@ The `garmin-pull` skill walks you through the one-time login and runs the pull.
 
 ```
 python3 scripts/garmin_setup.py                     # once: email, password (hidden), 2FA code if asked
-python3 scripts/garmin_pull.py                      # last 30 days, everything -> ./garmin-data
+python3 scripts/garmin_pull.py                      # last 30 days, daily summaries -> ./garmin-data
 python3 scripts/garmin_pull.py --last 1y --what sleep,hrv,summary
 python3 scripts/garmin_pull.py --since 2026-01-01 --until 2026-06-30 --what activities --workout-files
-python3 scripts/garmin_pull.py --everything         # the full drop, see below
+python3 scripts/garmin_pull.py --full-day --last 7d # every data point of each day, see below
+python3 scripts/garmin_pull.py --all-history        # from your first Garmin activity to today
 ```
 
 | flag | meaning |
 |---|---|
-| `--what LIST` | `all` (default) or any of `sleep`, `hrv`, `summary`, `vo2max`, `activities`, comma-separated |
+| `--what LIST` | `all` (default: the five daily summaries) or any of `sleep`, `hrv`, `summary`, `vo2max`, `activities`, `detail`, comma-separated |
+| `--full-day` | every data point the watch stored each day: all summaries + `detail` + workout files |
 | `--last PERIOD` | `30d` (default), `12w`, `6m`, `2y` ... |
 | `--since DATE` `--until DATE` | an explicit range, `YYYY-MM-DD` |
-| `--everything` | full drop: all categories plus workout files, from your first Garmin activity to today |
+| `--all-history` | from your first Garmin activity to today |
 | `--workout-files` | also save each workout's TCX file (per-second heart rate, pace, GPS) |
 | `--out FOLDER` | where to write (default `./garmin-data`) |
 | `--format` | `csv`, `sqlite` or both (default both; raw JSON is always written) |
@@ -42,13 +45,28 @@ python3 scripts/garmin_pull.py --everything         # the full drop, see below
 Before a pull the script prints the range, the categories, and roughly how long it
 will take. Anything over about 15 minutes asks for a yes first (`--yes` skips that).
 
-### The full drop
+### Every data point of a day
 
-`--everything` first pages through your activity list to find your oldest workout,
-then pulls every category from that day to today, plus the TCX file of every
-workout. For a watch worn for five years that is around 7,000 requests and well over
-an hour, and Garmin will almost certainly rate-limit you partway. That is fine and
-expected: the pull stops cleanly, and rerunning the same command later continues
+The five summaries are one row per day. `--full-day` (or `--what detail`) adds what
+the watch actually recorded through the day: heart rate every two minutes, stress
+and body battery every three, steps per quarter hour, breathing rate, SpO2, HRV
+readings through the night, sleep stages and movement, plus that day's training
+readiness, hydration, training status, endurance score and fitness age. It is about
+14 requests per day, so four times the cost of the summaries; a day comes out at
+roughly 4,000 timeline rows.
+
+Two extra files appear: `timeline.csv` (date, series, time_gmt, value, value2, one row
+per measurement) and `snapshots.csv` (date, metric, value). Both are tables in
+`garmin.db` too. The untouched Garmin responses are kept under `raw/detail/<day>/`,
+one JSON per endpoint, so anything the flattening does not cover is still there.
+
+### All of your history
+
+`--all-history` first pages through your activity list to find your oldest workout,
+then pulls from that day to today. Combine with `--full-day` for the total drop. For a
+watch worn for five years the summaries alone are around 7,000 requests and well
+over an hour, and Garmin will almost certainly rate-limit you partway. That is fine
+and expected: the pull stops cleanly, and rerunning the same command later continues
 from the last day on disk. Two or three sessions usually get everything.
 
 ## What you get
@@ -57,9 +75,11 @@ from the last day on disk. Two or three sessions usually get everything.
 garmin-data/
   raw/2026-05-01.json ...   one shaped JSON per day, also the resume checkpoint
   raw/activities.json
+  raw/detail/<day>/*.json   untouched responses, one per endpoint (detail / --full-day)
   sleep.csv  hrv.csv  summary.csv  vo2max.csv  activities.csv
-  garmin.db                 SQLite, one table per category, keyed on date / activity_id
-  tcx/<activity_id>.tcx     with --workout-files or --everything
+  timeline.csv  snapshots.csv   every measurement / every daily metric (detail)
+  garmin.db                 SQLite, one table per CSV, keyed on date / activity_id
+  tcx/<activity_id>.tcx     with --workout-files or --full-day
 ```
 
 Empty cells mean Garmin did not report that metric for that day. Nothing is

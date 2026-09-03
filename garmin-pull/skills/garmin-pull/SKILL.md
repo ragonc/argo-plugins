@@ -23,12 +23,17 @@ the rest in one short message with defaults offered:
    - summary (resting heart rate, stress, body battery, steps, calories, intensity minutes)
    - vo2max
    - activities (every workout: distance, duration, heart rate, power, training effect)
-   Default: all five. "Just my sleep and HRV" becomes `--what sleep,hrv`.
-   "Everything you have" or "a full export" means `--everything`: every category plus
-   workout files, from their first Garmin activity to today. Warn that it is long (often
-   over an hour, in two or three sessions because Garmin rate-limits) before starting.
+   Default: all five daily summaries. "Just my sleep and HRV" becomes `--what sleep,hrv`.
+   "Everything the watch recorded", "all data points", "the intraday data" means
+   `--full-day`: the summaries plus every timestamped measurement of each day (heart
+   rate, stress, body battery, steps, breathing, SpO2, HRV, sleep stages) and the day's
+   readiness, hydration, training status, endurance and fitness age, plus workout
+   files. About four times the cost of the summaries; say so for long ranges.
 2. **Which period.** Default: last 30 days (`--last 30d`; also `12w`, `6m`, `2y`, or
-   `--since`/`--until` dates). A year of daily data takes about 10 minutes; say so.
+   `--since`/`--until` dates). "All my history" means `--all-history`: from their first
+   Garmin activity to today. Warn that it is long (often over an hour, in two or three
+   sessions because Garmin rate-limits) before starting. A year of summaries takes
+   about 10 minutes; say so.
 3. **Where.** Default: a `garmin-data` folder in the current directory.
 
 ## Step 1: check setup
@@ -57,21 +62,23 @@ Build one command from step 0, show it, run it. Examples:
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --last 30d
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --last 1y --what sleep,hrv,summary
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --since 2026-01-01 --until 2026-06-30 --what activities --workout-files
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --everything --yes
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --full-day --last 7d
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --all-history --yes
 ```
 
 Use `--out <folder>` when they named a place. Add `--workout-files` only if they want
 the raw per-second workout files. The script prints an estimate before it starts and
 asks for confirmation over 15 minutes; pass `--yes` since you cannot answer a prompt,
 and tell them the estimate yourself. Run long pulls with a generous timeout.
-For `--everything`, expect it to stop on a rate limit partway: report where it got to
+For `--all-history`, expect it to stop on a rate limit partway: report where it got to
 and that rerunning the same command an hour later continues from there.
 
 ## Step 3: report
 
 Read the last lines of the script's output and tell them, in a few sentences:
 - what was pulled (days and categories) and where the files are
-- the three files most people want: the CSVs, `garmin.db`, and `raw/` for JSON
+- the three files most people want: the CSVs, `garmin.db`, and `raw/` for JSON; with
+  `--full-day`, point at `timeline.csv` (one row per measurement, `series` says which)
 - any days that failed and why (the script records them, it never fills gaps)
 
 If the run stopped with a rate-limit message (exit code 3), say plainly that Garmin
@@ -81,7 +88,8 @@ hour continues from where it stopped. Do not retry in a loop.
 ## Answering questions afterwards
 
 Once the data is on disk, answer questions from the files, not from Garmin: `garmin.db`
-has one table per category with `date` as the key (`activity_id` for activities). One
+has one table per category with `date` as the key (`activity_id` for activities;
+`timeline` is keyed on date, series and time_gmt). One
 `sqlite3` or Python query per question is enough. Empty cells mean Garmin did not
 provide that metric for that day, usually because the watch was not worn or the
 feature is not on their device. Say that rather than guessing.
