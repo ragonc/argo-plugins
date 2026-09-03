@@ -90,6 +90,19 @@ If the run stopped with a rate-limit message (exit code 3), say plainly that Gar
 throttled the connection, nothing is lost, and rerunning the same command in about an
 hour continues from where it stopped. Do not retry in a loop.
 
+## Offer the weekly check, once
+
+After a successful first pull, mention once that a weekly self-check exists and
+schedule it if they want it:
+
+```
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_canary.py --install
+```
+
+Add `--webhook <url>` if they have a Discord or Slack webhook to be told on failure;
+otherwise it just logs to `~/.garmin-pull/canary.log`. It runs on their machine only.
+Do not push it if they say no.
+
 ## Answering questions afterwards
 
 Once the data is on disk, answer questions from the files, not from Garmin: `garmin.db`

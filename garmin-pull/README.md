@@ -76,6 +76,26 @@ The last thing printed, also saved as `report.txt`: days complete, days with err
 days Garmin had no data for, timeline series with row counts, files written, and any
 schema drift. If the run was cut short by rate limiting it says so and what to do.
 
+### Keeping it healthy: the weekly check
+
+Garmin changes its login flow and response shapes now and then, and when that
+happens every tool of this kind breaks at once. Run the check on your own machine
+so you hear about it before you need the data:
+
+```
+python3 scripts/garmin_canary.py                 # once, prints the verdict
+python3 scripts/garmin_canary.py --install       # every Monday 08:15, Linux (systemd) or macOS (launchd)
+python3 scripts/garmin_canary.py --install --webhook https://discord.com/api/webhooks/...
+python3 scripts/garmin_canary.py --uninstall
+```
+
+It restores your cached session, fetches yesterday's summaries and every detail
+endpoint, flattens them, and compares field names with the baseline. Exit 0 is
+healthy, 2 means Garmin changed something but the pull still works, 1 means broken.
+With a webhook it posts only when the verdict is not healthy; without one it just
+appends to `~/.garmin-pull/canary.log`. On Windows it prints the command to put in
+Task Scheduler. Nothing runs anywhere but your own computer.
+
 ### Something not working? The doctor
 
 ```
