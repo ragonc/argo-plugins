@@ -23,9 +23,12 @@ the rest in one short message with defaults offered:
    - summary (resting heart rate, stress, body battery, steps, calories, intensity minutes)
    - vo2max
    - activities (every workout: distance, duration, heart rate, power, training effect)
-   Default: all five. "Just my sleep and HRV" becomes `--only sleep,hrv`.
-2. **Which period.** Default: last 30 days. A year of daily data is roughly 365 × 4
-   requests and takes about 10 minutes with the built-in pause; say so.
+   Default: all five. "Just my sleep and HRV" becomes `--what sleep,hrv`.
+   "Everything you have" or "a full export" means `--everything`: every category plus
+   workout files, from their first Garmin activity to today. Warn that it is long (often
+   over an hour, in two or three sessions because Garmin rate-limits) before starting.
+2. **Which period.** Default: last 30 days (`--last 30d`; also `12w`, `6m`, `2y`, or
+   `--since`/`--until` dates). A year of daily data takes about 10 minutes; say so.
 3. **Where.** Default: a `garmin-data` folder in the current directory.
 
 ## Step 1: check setup
@@ -51,14 +54,18 @@ for them and do not ask them to paste the password into the chat.
 Build one command from step 0, show it, run it. Examples:
 
 ```
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --days 30
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --days 365 --only sleep,hrv,summary
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --from 2026-01-01 --to 2026-06-30 --only activities --tcx
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --last 30d
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --last 1y --what sleep,hrv,summary
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --since 2026-01-01 --until 2026-06-30 --what activities --workout-files
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_pull.py --everything --yes
 ```
 
-Use `--out <folder>` when they named a place. Add `--tcx` only if they want the raw
-per-second workout files. For anything over 90 days, tell them how long it will take
-before starting, and run it with a timeout generous enough to finish.
+Use `--out <folder>` when they named a place. Add `--workout-files` only if they want
+the raw per-second workout files. The script prints an estimate before it starts and
+asks for confirmation over 15 minutes; pass `--yes` since you cannot answer a prompt,
+and tell them the estimate yourself. Run long pulls with a generous timeout.
+For `--everything`, expect it to stop on a rate limit partway: report where it got to
+and that rerunning the same command an hour later continues from there.
 
 ## Step 3: report
 

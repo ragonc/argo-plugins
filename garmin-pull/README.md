@@ -22,19 +22,34 @@ The `garmin-pull` skill walks you through the one-time login and runs the pull.
 
 ```
 python3 scripts/garmin_setup.py                     # once: email, password (hidden), 2FA code if asked
-python3 scripts/garmin_pull.py --days 30            # everything, last 30 days -> ./garmin-data
-python3 scripts/garmin_pull.py --days 365 --only sleep,hrv,summary
-python3 scripts/garmin_pull.py --from 2026-01-01 --to 2026-06-30 --only activities --tcx
+python3 scripts/garmin_pull.py                      # last 30 days, everything -> ./garmin-data
+python3 scripts/garmin_pull.py --last 1y --what sleep,hrv,summary
+python3 scripts/garmin_pull.py --since 2026-01-01 --until 2026-06-30 --what activities --workout-files
+python3 scripts/garmin_pull.py --everything         # the full drop, see below
 ```
 
 | flag | meaning |
 |---|---|
-| `--only a,b` | any of `sleep`, `hrv`, `summary`, `vo2max`, `activities` (default all) |
-| `--days N` / `--from` `--to` | date range (default last 30 days) |
-| `--out DIR` | output folder (default `./garmin-data`) |
-| `--format` | `csv`, `sqlite`, `json` in any combination (JSON always kept) |
-| `--tcx` | also save each workout's TCX file |
+| `--what LIST` | `all` (default) or any of `sleep`, `hrv`, `summary`, `vo2max`, `activities`, comma-separated |
+| `--last PERIOD` | `30d` (default), `12w`, `6m`, `2y` ... |
+| `--since DATE` `--until DATE` | an explicit range, `YYYY-MM-DD` |
+| `--everything` | full drop: all categories plus workout files, from your first Garmin activity to today |
+| `--workout-files` | also save each workout's TCX file (per-second heart rate, pace, GPS) |
+| `--out FOLDER` | where to write (default `./garmin-data`) |
+| `--format` | `csv`, `sqlite` or both (default both; raw JSON is always written) |
 | `--refresh` | re-pull days already on disk |
+
+Before a pull the script prints the range, the categories, and roughly how long it
+will take. Anything over about 15 minutes asks for a yes first (`--yes` skips that).
+
+### The full drop
+
+`--everything` first pages through your activity list to find your oldest workout,
+then pulls every category from that day to today, plus the TCX file of every
+workout. For a watch worn for five years that is around 7,000 requests and well over
+an hour, and Garmin will almost certainly rate-limit you partway. That is fine and
+expected: the pull stops cleanly, and rerunning the same command later continues
+from the last day on disk. Two or three sessions usually get everything.
 
 ## What you get
 
@@ -44,7 +59,7 @@ garmin-data/
   raw/activities.json
   sleep.csv  hrv.csv  summary.csv  vo2max.csv  activities.csv
   garmin.db                 SQLite, one table per category, keyed on date / activity_id
-  tcx/<activity_id>.tcx     with --tcx
+  tcx/<activity_id>.tcx     with --workout-files or --everything
 ```
 
 Empty cells mean Garmin did not report that metric for that day. Nothing is
