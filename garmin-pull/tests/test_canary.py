@@ -44,5 +44,20 @@ class TestAssess(unittest.TestCase):
         self.assertIn("heart_rate +newField", text)
 
 
+    def test_unmapped_lists_count_as_changed(self):
+        drift = {"unmapped": ["stress.x: 2 numeric columns (first seen 2026-09-02)"]}
+        code, text = gc.assess(SUMMARY, OK_STATUS, rows(20, 200), drift)
+        self.assertEqual(code, gc.CHANGED)
+        self.assertIn("1 list(s) not flattened", text)
+
+
+class TestWebhook(unittest.TestCase):
+    def test_only_https_is_accepted(self):
+        self.assertIsNone(gc.valid_webhook(None))
+        self.assertEqual(gc.valid_webhook("https://discord.com/api/webhooks/1"), "https://discord.com/api/webhooks/1")
+        with self.assertRaises(SystemExit):
+            gc.valid_webhook("http://discord.com/api/webhooks/1")
+
+
 if __name__ == "__main__":
     unittest.main()

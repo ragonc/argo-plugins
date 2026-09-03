@@ -61,10 +61,13 @@ def main() -> int:
         age_h = (time.time() - SESSION_CACHE_PATH.stat().st_mtime) / 3600
         session = load_session(SESSION_CACHE_PATH)
         if session is None:
-            line(WARN, f"cached session at {SESSION_CACHE_PATH} is no longer usable (last saved {age_h:.0f}h ago); "
+            line(WARN, f"cached session at {SESSION_CACHE_PATH} is unreadable (last saved {age_h:.0f}h ago); "
                        f"the next pull logs in again and may ask for a two-factor code")
         else:
-            line(OK, f"cached session usable, last saved {age_h:.0f}h ago")
+            line(OK, f"cached session found, last saved {age_h:.0f}h ago"
+                     + (" (over 11 months: the year-long token may expire soon)" if age_h > 11 * 30 * 24 else ""))
+        if os.name != "nt" and SESSION_CACHE_PATH.stat().st_mode & 0o077:
+            line(WARN, f"{SESSION_CACHE_PATH} is readable by other users; run: chmod 600 {SESSION_CACHE_PATH}")
     else:
         line(WARN, "no cached session yet: the first pull logs in and may ask for a two-factor code")
 
@@ -80,9 +83,9 @@ def main() -> int:
                 line(WARN, f"{CREDENTIALS_PATH} is readable by other users; run: chmod 600 {CREDENTIALS_PATH}")
     except GarminConnectError:
         if session is not None:
-            line(WARN, f"no stored credentials; fine while the cached session lasts, then run  {setup}")
+            line(OK, f"no stored password (the default); when the session expires, run  {setup}")
         else:
-            line(FAIL, f"no credentials: run  {setup}  in your terminal")
+            line(FAIL, f"not logged in yet: run  {setup}  in your terminal")
             failed = True
 
     # 4. previous output
@@ -116,8 +119,9 @@ def main() -> int:
         line(OK, f"Garmin answered in {time.time() - started:.1f}s, logged in as {name}")
     except GarminConnectError as exc:
         text = str(exc)
-        if "429" in text:
-            line(FAIL, "Garmin is rate-limiting this connection right now; wait an hour and try again")
+        if exc.rate_limited:
+            wait = f"about {exc.retry_after // 60 + 1} minutes" if exc.retry_after else "an hour"
+            line(FAIL, f"Garmin is rate-limiting this connection right now; wait {wait} and try again")
         elif "two-factor" in text or "MFA" in text:
             line(FAIL, "a two-factor code is needed: run garmin_setup.py in your terminal")
         else:

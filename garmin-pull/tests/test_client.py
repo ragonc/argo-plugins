@@ -374,7 +374,7 @@ class TestFetchActivitiesSince(unittest.TestCase):
             _activity(1, "2026-08-27"),  # older than cutoff -- excluded
         ]]
         session = _StubActivitiesSession(pages)
-        result = session.fetch_activities_since("2026-08-29", page_size=20)
+        result = session.fetch_activities_since("2026-08-29", page_size=20, pause=0)
         self.assertEqual([a["activityId"] for a in result], [3, 2])
         self.assertEqual(session.calls, [(0, 20)])  # one page, no need to page further
 
@@ -382,7 +382,7 @@ class TestFetchActivitiesSince(unittest.TestCase):
         page0 = [_activity(i, "2026-08-30") for i in range(3, 1, -1)]  # 2 entries, size < page_size
         pages = [page0]
         session = _StubActivitiesSession(pages)
-        result = session.fetch_activities_since("2026-08-01", page_size=2)
+        result = session.fetch_activities_since("2026-08-01", page_size=2, pause=0)
         # page0 has exactly page_size entries and none is older than cutoff,
         # so a second page is requested; the stub has none -> empty -> stop.
         self.assertEqual(len(session.calls), 2)
@@ -390,17 +390,50 @@ class TestFetchActivitiesSince(unittest.TestCase):
 
     def test_empty_result_when_no_activities(self):
         session = _StubActivitiesSession([[]])
-        result = session.fetch_activities_since("2026-08-01")
+        result = session.fetch_activities_since("2026-08-01", pause=0)
         self.assertEqual(result, [])
+        self.assertFalse(session.activity_paging_capped)
 
     def test_max_pages_is_a_hard_stop(self):
         # Every page is exactly page_size long and always in range, so
         # without max_pages this would page forever.
         pages = [[_activity(i, "2026-08-30")] for i in range(50)]
         session = _StubActivitiesSession(pages)
-        result = session.fetch_activities_since("2026-08-01", page_size=1, max_pages=5)
+        result = session.fetch_activities_since("2026-08-01", page_size=1, max_pages=5, pause=0)
         self.assertEqual(len(session.calls), 5)
         self.assertEqual(len(result), 5)
+
+
+class TestErrorStatus(unittest.TestCase):
+    def test_http_error_carries_status_and_retry_after(self):
+        exc = gc._http_error(gc.GarminAPIError, "connectapi /x failed", 429, {"Retry-After": "120"}, b"slow down")
+        self.assertIsInstance(exc, gc.GarminAPIError)
+        self.assertEqual((exc.status, exc.retry_after), (429, 120))
+        self.assertTrue(exc.rate_limited)
+        self.assertFalse(exc.permanent)
+        self.assertIn("HTTP 429", str(exc))
+
+    def test_permanent_means_4xx_but_not_429(self):
+        self.assertTrue(gc._http_error(gc.GarminAPIError, "c", 404, {}, b"").permanent)
+        self.assertTrue(gc._http_error(gc.GarminAPIError, "c", 403, {}, b"").permanent)
+        self.assertFalse(gc._http_error(gc.GarminAPIError, "c", 500, {}, b"").permanent)
+        self.assertFalse(gc._http_error(gc.GarminAPIError, "c", 429, {}, b"").permanent)
+        self.assertFalse(gc.GarminConnectError("could not reach host").permanent)
+        self.assertIsNone(gc.GarminConnectError("could not reach host").status)
+
+    def test_retry_after_header_is_case_insensitive_and_tolerant(self):
+        self.assertEqual(gc._retry_after({"retry-after": "5"}), 5)
+        self.assertEqual(gc._retry_after({"Retry-After": "2.9"}), 2)
+        self.assertIsNone(gc._retry_after({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}))
+        self.assertIsNone(gc._retry_after({}))
+
+    def test_connectapi_raises_with_status(self):
+        session = gc.GarminSession()
+        session.oauth2_token = gc.OAuth2Token("t", "Bearer", "r", int(gc.time.time()) + 3600, 0)
+        session._request = lambda *a, **k: (404, {}, b"nope")
+        with self.assertRaises(gc.GarminAPIError) as ctx:
+            session.connectapi("/x")
+        self.assertEqual(ctx.exception.status, 404)
 
 
 class TestLoadCredentials(unittest.TestCase):
@@ -523,13 +556,31 @@ class TestSessionCaching(unittest.TestCase):
         self.cache_path.write_text(gc.json.dumps(data), encoding="utf-8")
         self.assertIsNone(gc.load_session(self.cache_path))
 
-    def test_load_session_with_expired_refresh_token_returns_none(self):
-        # Refresh token itself expired -- the hard stop. Only a full SSO
-        # login can recover from this; the cache must be refused, not
-        # silently treated as usable.
+    def test_load_session_with_expired_refresh_token_is_still_usable(self):
+        # The OAuth2 refresh token is never used: refresh_oauth2() re-mints
+        # the access token from the OAuth1 token (about a year). A cache
+        # whose refresh_token_expires_at is in the past must therefore NOT
+        # be refused -- refusing it was what forced a monthly re-login.
         session = self._fake_session(access_expires_in=-100, refresh_expires_in=-10)
         gc.save_session(session, self.cache_path)
-        self.assertIsNone(gc.load_session(self.cache_path))
+        restored = gc.load_session(self.cache_path)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.oauth1_token.oauth_token, "fake-oauth1-token")
+
+    def test_saved_file_is_written_atomically(self):
+        # No temp file left behind, and the target is the complete document.
+        session = self._fake_session()
+        gc.save_session(session, self.cache_path)
+        self.assertEqual([p.name for p in self.cache_path.parent.iterdir()], [self.cache_path.name])
+        self.assertIn("oauth1", gc.json.loads(self.cache_path.read_text()))
+
+    def test_credentials_file_is_0600_and_atomic(self):
+        import stat
+        path = self.cache_path.parent / "credentials.toml"
+        gc.save_credentials("me@example.com", 'p"w', path)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["credentials.toml"])
+        self.assertEqual(gc.load_credentials(path), ("me@example.com", 'p"w'))
 
     def test_load_session_with_expired_access_but_live_refresh_is_usable(self):
         # This is the case caching exists for: access token expired, but
@@ -545,12 +596,10 @@ class TestSessionCaching(unittest.TestCase):
 
     def test_cache_file_never_deleted_on_refusal(self):
         # This project never deletes without being asked -- confirm a
-        # refused cache (expired refresh token) is left on disk untouched,
-        # not removed as a side effect of load_session() refusing it.
-        session = self._fake_session(access_expires_in=-100, refresh_expires_in=-10)
-        gc.save_session(session, self.cache_path)
-        self.assertTrue(self.cache_path.is_file())
-        gc.load_session(self.cache_path)
+        # refused cache (wrong version) is left on disk untouched, not
+        # removed as a side effect of load_session() refusing it.
+        self.cache_path.write_text(gc.json.dumps({"cache_version": 999}), encoding="utf-8")
+        self.assertIsNone(gc.load_session(self.cache_path))
         self.assertTrue(self.cache_path.is_file())
 
     def test_save_session_without_login_raises(self):
@@ -568,6 +617,69 @@ class TestSessionCaching(unittest.TestCase):
 
         restored = gc.load_session(self.cache_path)
         self.assertEqual(restored.oauth2_token.access_token, "second-fake-access-token")
+
+    def test_open_session_refreshes_an_expired_access_token_up_front(self):
+        session = self._fake_session(access_expires_in=-100, refresh_expires_in=-10)
+        gc.save_session(session, self.cache_path)
+        calls = []
+
+        def fake_refresh(self_):
+            calls.append("refresh")
+            self_.oauth2_token.expires_at = int(gc.time.time()) + 3600
+
+        original = gc.GarminSession.refresh_oauth2
+        gc.GarminSession.refresh_oauth2 = fake_refresh
+        try:
+            restored = gc.open_session(cache_path=self.cache_path, interactive=False, log=lambda _m: None)
+        finally:
+            gc.GarminSession.refresh_oauth2 = original
+        self.assertEqual(calls, ["refresh"])
+        self.assertFalse(restored.oauth2_token.expired)
+        # and the refreshed token was written back
+        self.assertFalse(gc.load_session(self.cache_path).oauth2_token.expired)
+
+    def test_open_session_falls_back_to_login_when_refresh_is_refused(self):
+        session = self._fake_session(access_expires_in=-100)
+        gc.save_session(session, self.cache_path)
+        events = []
+
+        def fake_refresh(self_):
+            raise gc.GarminAuthError("OAuth1->OAuth2 token exchange failed: HTTP 401", status=401)
+
+        def fake_login(self_, username, password, *, mfa_code=None):
+            events.append(("login", username))
+            self_.oauth1_token = gc.OAuth1Token("new-o1", "new-s")
+            self_.oauth2_token = gc.OAuth2Token("new-access", "Bearer", "r", int(gc.time.time()) + 3600,
+                                                int(gc.time.time()) + 3600)
+
+        originals = gc.GarminSession.refresh_oauth2, gc.GarminSession.login
+        gc.GarminSession.refresh_oauth2, gc.GarminSession.login = fake_refresh, fake_login
+        try:
+            restored = gc.open_session(cache_path=self.cache_path, interactive=False,
+                                       credentials=("me@example.com", "pw"), log=lambda _m: None)
+        finally:
+            gc.GarminSession.refresh_oauth2, gc.GarminSession.login = originals
+        self.assertEqual(events, [("login", "me@example.com")])
+        self.assertEqual(restored.oauth2_token.access_token, "new-access")
+        self.assertEqual(gc.load_session(self.cache_path).oauth1_token.oauth_token, "new-o1")
+
+    def test_open_session_does_not_log_in_when_refresh_is_rate_limited(self):
+        session = self._fake_session(access_expires_in=-100)
+        gc.save_session(session, self.cache_path)
+
+        def fake_refresh(self_):
+            raise gc.GarminAuthError("HTTP 429", status=429, retry_after=90)
+
+        original = gc.GarminSession.refresh_oauth2
+        gc.GarminSession.refresh_oauth2 = fake_refresh
+        try:
+            with self.assertRaises(gc.GarminAuthError) as ctx:
+                gc.open_session(cache_path=self.cache_path, interactive=False,
+                                credentials=("me@example.com", "pw"), log=lambda _m: None)
+        finally:
+            gc.GarminSession.refresh_oauth2 = original
+        self.assertTrue(ctx.exception.rate_limited)
+        self.assertEqual(ctx.exception.retry_after, 90)
 
     def test_mfa_token_is_not_persisted(self):
         # oauth1.mfa_token is a one-shot login value, deliberately excluded

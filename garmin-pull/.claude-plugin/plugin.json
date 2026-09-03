@@ -1,7 +1,7 @@
 {
   "name": "garmin-pull",
   "description": "Pull your own Garmin Connect wellness and activity data (sleep, HRV, resting HR, stress, body battery, steps, VO2max, workouts) into CSV, SQLite and JSON, with guided setup and partial-data selection. Standard library only.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": { "name": "Carmine Ragone" },
   "keywords": ["garmin", "health", "training", "wellness", "sleep", "hrv", "csv", "sqlite"]
 }

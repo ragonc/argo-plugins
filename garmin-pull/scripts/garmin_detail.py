@@ -19,10 +19,15 @@ How the flattening adapts to Garmin's shapes instead of hardcoding them:
     column is the timestamp and what the others mean. The flattener reads those
     descriptors, so a reordered or extended array still lands in the right
     columns. Without descriptors it assumes [timestamp, value].
-  * Any list of dicts with a recognisable time field becomes a series; the value
-    is the first numeric field, and the first text field goes to value2.
+  * Any list of dicts with a recognisable time field becomes a series when the
+    value column is unambiguous: a known value field, or exactly one numeric
+    field. When two or more numeric fields could be the value, nothing is
+    guessed: the series is left out and the report names it, so you can look at
+    the raw JSON instead of trusting a plausible-looking wrong number.
   * Every scalar field of a response becomes a snapshot metric, named from the
-    endpoint and the field. New fields Garmin adds show up on their own.
+    endpoint and the field. New fields Garmin adds show up on their own. When
+    Garmin reports per device (training status does), the primary device keeps
+    the plain name and any other device gets its id in the metric name.
   * The names you would expect (heart_rate_bpm, stress_level, ...) come from a
     small alias table; anything unknown gets a generated name rather than being
     dropped.
@@ -124,40 +129,57 @@ NOISE_KEYS = re.compile(r"(userProfilePK|userProfilePk|userId|deviceId|Descripto
 
 def fetch_detail(session: GarminSession, day: str, out_dir: Path, pause: float = 0.3) -> dict[str, str]:
     """Fetch every endpoint for `day` into out_dir/<name>.json. Returns
-    {name: "ok" | "empty" | "error: ..."}; raises only on rate limiting so the
-    caller can stop the whole run."""
+    {name: "ok" | "empty" | "none: HTTP 4xx" | "error: ..."}. "none" means
+    Garmin refused that endpoint for that day (404 and friends): final, not
+    retried on later runs. "error" (5xx, network) is retried next run.
+    Raises only on rate limiting so the caller can stop the whole run."""
     out_dir.mkdir(parents=True, exist_ok=True)
     username = session._garmin_username()
-    status: dict[str, str] = {}
-    for i, (name, (path_fn, params_fn)) in enumerate(ENDPOINTS.items()):
+    status = _read_index(out_dir)
+    requested = 0
+    for name, (path_fn, params_fn) in ENDPOINTS.items():
         target = out_dir / f"{name}.json"
         if target.exists():
-            status[name] = "ok"
+            status[name] = "ok" if target.stat().st_size > 5 else "empty"
             continue
-        if i and pause:
+        if str(status.get(name, "")).startswith("none"):
+            continue
+        if requested and pause:
             time.sleep(pause)
+        requested += 1
         try:
             raw = session.connectapi(path_fn(day, username), params=params_fn(day) if params_fn else None)
         except GarminConnectError as exc:
-            if "429" in str(exc):
+            if exc.rate_limited:
+                _write_index(out_dir, status)
                 raise
-            status[name] = f"error: {str(exc)[:120]}"
+            status[name] = f"{'none' if exc.permanent else 'error'}: {str(exc)[:120]}"
             continue
         target.write_text(json.dumps(raw, indent=1) + "\n")
         status[name] = "ok" if raw else "empty"
-    (out_dir / "_index.json").write_text(json.dumps(status, indent=1) + "\n")
+    _write_index(out_dir, status)
     return status
 
 
-def detail_complete(out_dir: Path) -> bool:
-    index = out_dir / "_index.json"
-    if not index.exists():
-        return False
+def _read_index(out_dir: Path) -> dict[str, str]:
     try:
-        status = json.loads(index.read_text())
-    except json.JSONDecodeError:
-        return False
-    return all(not str(v).startswith("error") for v in status.values()) and set(status) >= set(ENDPOINTS)
+        data = json.loads((out_dir / "_index.json").read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_index(out_dir: Path, status: dict[str, str]) -> None:
+    (out_dir / "_index.json").write_text(json.dumps(status, indent=1) + "\n")
+
+
+def detail_complete(out_dir: Path) -> bool:
+    """True when every endpoint has a final answer for the day: data, an
+    empty response, or a definitive refusal. Only "error" entries (and
+    endpoints never asked) keep a day incomplete."""
+    status = _read_index(out_dir)
+    return bool(status) and set(status) >= set(ENDPOINTS) and all(
+        not str(v).startswith("error") for v in status.values())
 
 
 # --- small helpers ---------------------------------------------------------------
@@ -213,8 +235,18 @@ def _series_name(endpoint: str, field: str) -> str:
     return SERIES_ALIASES.get((endpoint, field)) or (f"{endpoint}_{snake(field)}" if field else endpoint)
 
 
+class Unmapped(Exception):
+    """Raised by the row builders when a list has a time column but no
+    unambiguous value column. Callers turn it into a report line."""
+
+
 def _array_rows(date: str, series: str, array: list, descriptors: dict[int, str] | None) -> list[dict]:
-    """Rows from an array of arrays, columns located via descriptors."""
+    """Rows from an array of arrays, columns located via descriptors. With
+    descriptors, the value column is the one whose name says it is a value
+    (level, value, average, score, steps, minutes ...), else the only numeric
+    column; without descriptors, column 1 when it is the only numeric one.
+    Several numeric columns and no name to pick by raises Unmapped: a wrong
+    column would produce plausible numbers, which is worse than none."""
     sample = next((x for x in array if isinstance(x, (list, tuple)) and x), None)
     if sample is None:
         return []
@@ -229,11 +261,21 @@ def _array_rows(date: str, series: str, array: list, descriptors: dict[int, str]
         candidates = [i for i in sorted(descriptors) if i != ts_index and i < len(sample)]
         numeric = [i for i in candidates if _is_number(sample[i])]
         preferred = [i for i in numeric if re.search(r"level|value|average|avg|score|steps|minutes", descriptors[i], re.I)]
-        value_index = (preferred or numeric or [None])[0]
+        if preferred:
+            value_index = preferred[0]
+        elif len(numeric) == 1:
+            value_index = numeric[0]
+        elif numeric:
+            raise Unmapped(f"{len(numeric)} numeric columns ({', '.join(descriptors[i] for i in numeric)}) "
+                           f"and none named like a value")
         text = [i for i in candidates if isinstance(sample[i], str)]
         value2_index = text[0] if text else None
-    if value_index is None:
-        value_index = 1 if len(sample) > 1 else None
+    else:
+        numeric = [i for i, v in enumerate(sample) if i != ts_index and _is_number(v)]
+        if len(numeric) == 1:
+            value_index = numeric[0]
+        elif numeric:
+            raise Unmapped(f"{len(numeric)} numeric columns and no descriptors to name them")
     if value_index is None:
         return []
     rows = []
@@ -261,7 +303,11 @@ def _dict_rows(date: str, series: str, items: list) -> list[dict]:
         return []
     value_key = next((k for k in VALUE_PREFERENCE if k in sample and _is_number(sample[k])), None)
     if value_key is None:
-        value_key = next((k for k, v in sample.items() if _is_number(v) and k != time_key and not NOISE_KEYS.search(k)), None)
+        numeric = [k for k, v in sample.items() if _is_number(v) and k != time_key and not NOISE_KEYS.search(k)]
+        if len(numeric) == 1:
+            value_key = numeric[0]
+        elif numeric:
+            raise Unmapped(f"{len(numeric)} numeric fields ({', '.join(numeric[:6])}) and none is a known value field")
     if value_key is None:
         return []
     text_key = next((k for k, v in sample.items() if isinstance(v, str) and k != time_key and _iso(v) is None
@@ -280,14 +326,27 @@ def _dict_rows(date: str, series: str, items: list) -> list[dict]:
     return rows
 
 
+def _device_names(node: dict) -> dict[str, str]:
+    """Garmin keys some blocks by device id. One device keeps the plain
+    'by_device' name (so the friendly aliases apply); with several, the one
+    flagged primaryTrainingDevice (else the first) is 'by_device' and the
+    others are 'device_<id>', so two watches never collapse into one metric."""
+    ids = [k for k in node if k.isdigit()]
+    if len(ids) <= 1:
+        return {k: "by_device" for k in ids}
+    primary = next((k for k in ids if isinstance(node[k], dict) and node[k].get("primaryTrainingDevice")), ids[0])
+    return {k: ("by_device" if k == primary else f"device_{k}") for k in ids}
+
+
 def _scalars(prefix: str, node, out: list[tuple[str, object]], depth: int = 0) -> None:
     """Collect every scalar under `node` as (metric, value), recursing into
-    dicts. Numeric dict keys (device ids) become 'by_device'."""
+    dicts. Numeric dict keys (device ids) are named by _device_names()."""
     if depth > 4:
         return
     if isinstance(node, dict):
+        devices = _device_names(node)
         for key, value in node.items():
-            name = "by_device" if key.isdigit() else snake(key)
+            name = devices.get(key) or snake(key)
             if isinstance(value, dict):
                 _scalars(f"{prefix}_{name}", value, out, depth + 1)
             elif value is None or isinstance(value, list) or NOISE_KEYS.search(key):
@@ -298,10 +357,15 @@ def _scalars(prefix: str, node, out: list[tuple[str, object]], depth: int = 0) -
 
 # --- flattening ------------------------------------------------------------------
 
-def flatten_endpoint(date: str, endpoint: str, response) -> tuple[list[dict], list[dict]]:
-    """(timeline rows, snapshot rows) for one raw response of any shape."""
+def flatten_endpoint(date: str, endpoint: str, response,
+                     unmapped: list[str] | None = None) -> tuple[list[dict], list[dict]]:
+    """(timeline rows, snapshot rows) for one raw response of any shape. A
+    list whose value column cannot be picked safely is left out of the
+    timeline and described in `unmapped` (when given) as
+    "<endpoint>.<field>: <why>"."""
     timeline: list[dict] = []
     scalars: list[tuple[str, object]] = []
+    notes = unmapped if unmapped is not None else []
     if isinstance(response, list):
         if response and all(isinstance(x, dict) for x in response):
             sample = response[0]
@@ -309,30 +373,33 @@ def flatten_endpoint(date: str, endpoint: str, response) -> tuple[list[dict], li
                 "gmt" in k.lower() and _iso(v) for k, v in sample.items())
             nested = any(isinstance(v, list) for v in sample.values())
             if has_time and not nested and len(sample) <= 8:
-                timeline += _dict_rows(date, _series_name(endpoint, ""), response)
+                timeline += _list_rows(date, endpoint, "", response, {}, notes)
             else:
                 # records: newest entry gives the snapshots, nested arrays flatten as series
                 newest = max(response, key=lambda x: str(x.get("timestamp") or x.get("calendarDate") or ""))
                 _scalars(endpoint, newest, scalars)
                 for key, value in newest.items():
                     if isinstance(value, list) and value:
-                        timeline += _list_rows(date, endpoint, key, value, newest)
+                        timeline += _list_rows(date, endpoint, key, value, newest, notes)
         return timeline, _snapshot_rows(date, scalars)
     if not isinstance(response, dict):
         return timeline, []
     _scalars(endpoint, response, scalars)
     for key, value in response.items():
         if isinstance(value, list) and value and "descriptor" not in key.lower():
-            timeline += _list_rows(date, endpoint, key, value, response)
+            timeline += _list_rows(date, endpoint, key, value, response, notes)
     return timeline, _snapshot_rows(date, scalars)
 
 
-def _list_rows(date: str, endpoint: str, field: str, value: list, parent: dict) -> list[dict]:
+def _list_rows(date: str, endpoint: str, field: str, value: list, parent: dict, notes: list[str]) -> list[dict]:
     series = _series_name(endpoint, field)
-    if isinstance(value[0], (list, tuple)):
-        return _array_rows(date, series, value, _descriptor_map(parent, field))
-    if isinstance(value[0], dict):
-        return _dict_rows(date, series, value)
+    try:
+        if isinstance(value[0], (list, tuple)):
+            return _array_rows(date, series, value, _descriptor_map(parent, field))
+        if isinstance(value[0], dict):
+            return _dict_rows(date, series, value)
+    except Unmapped as why:
+        notes.append(f"{endpoint}.{field or '(list)'}: {why}; not flattened, see the raw JSON")
     return []
 
 
@@ -345,6 +412,9 @@ PREFIX_ALIASES: tuple[tuple[str, str], ...] = (
     ("body_battery_end_of_day_body_battery_", "body_battery_end_of_day_"),
     ("training_status_most_recent_training_status_latest_training_status_data_by_device_", "training_status_"),
     ("training_status_most_recent_training_load_balance_metrics_map_by_device_", "training_load_balance_"),
+    # secondary devices: same wrappers, "device_<id>" instead of "by_device"
+    ("training_status_most_recent_training_status_latest_training_status_data_", "training_status_"),
+    ("training_status_most_recent_training_load_balance_metrics_map_", "training_load_balance_"),
     ("training_status_most_recent_", "training_status_"),
 )
 
@@ -365,10 +435,10 @@ def _snapshot_rows(date: str, scalars: list[tuple[str, object]]) -> list[dict]:
     return rows
 
 
-def flatten_timeline(date: str, raw: dict[str, object]) -> list[dict]:
+def flatten_timeline(date: str, raw: dict[str, object], unmapped: list[str] | None = None) -> list[dict]:
     rows: list[dict] = []
     for endpoint, response in raw.items():
-        rows += flatten_endpoint(date, endpoint, response)[0]
+        rows += flatten_endpoint(date, endpoint, response, unmapped)[0]
     return rows
 
 
@@ -377,6 +447,18 @@ def flatten_snapshots(date: str, raw: dict[str, object]) -> list[dict]:
     for endpoint, response in raw.items():
         rows += flatten_endpoint(date, endpoint, response)[1]
     return rows
+
+
+def flatten_day(date: str, raw: dict[str, object]) -> tuple[list[dict], list[dict], list[str]]:
+    """(timeline, snapshots, unmapped notes) for one day's raw responses."""
+    timeline: list[dict] = []
+    snapshots: list[dict] = []
+    notes: list[str] = []
+    for endpoint, response in raw.items():
+        t, s = flatten_endpoint(date, endpoint, response, notes)
+        timeline += t
+        snapshots += s
+    return timeline, snapshots, notes
 
 
 # --- schema drift ------------------------------------------------------------------
@@ -450,23 +532,53 @@ def load_detail_day(day_dir: Path) -> dict[str, object]:
     return raw
 
 
-def detail_tables(detail_root: Path) -> tuple[list[dict], list[dict], dict[str, dict[str, list[str]]]]:
-    """(timeline, snapshots, drift) for every day under detail_root. Drift is
-    merged across days: a field counts as added/missing if any day shows it."""
-    timeline: list[dict] = []
-    snapshots: list[dict] = []
-    drift: dict[str, dict[str, set[str]]] = {}
+class DriftLog:
+    """Schema drift and unmapped lists merged across days: a field counts as
+    added/missing if any day shows it; an unmapped list is reported once."""
+
+    def __init__(self, baseline: dict[str, list[str]] | None = None):
+        self.baseline = load_baseline() if baseline is None else baseline
+        self._drift: dict[str, dict[str, set[str]]] = {}
+        self._unmapped: dict[str, str] = {}  # note -> first day seen
+
+    def add(self, day: str, raw: dict[str, object], notes: list[str]) -> None:
+        for endpoint, change in schema_drift(raw, self.baseline).items():
+            slot = self._drift.setdefault(endpoint, {"added": set(), "missing": set()})
+            slot["added"] |= set(change["added"])
+            slot["missing"] |= set(change["missing"])
+        for note in notes:
+            self._unmapped.setdefault(note, day)
+
+    def result(self) -> dict:
+        """{endpoint: {"added": [...], "missing": [...]}, plus "unmapped":
+        ["<note> (first seen <day>)", ...] when any list was left out}."""
+        out: dict = {e: {k: sorted(v) for k, v in c.items()} for e, c in self._drift.items()}
+        if self._unmapped:
+            out["unmapped"] = [f"{note} (first seen {day})" for note, day in sorted(self._unmapped.items())]
+        return out
+
+
+def iter_detail_days(detail_root: Path):
+    """Yield (day, timeline rows, snapshot rows, unmapped notes, raw) one day
+    at a time, so a multi-year pull never holds more than a day in memory."""
     if not detail_root.exists():
-        return timeline, snapshots, {}
-    baseline = load_baseline()
+        return
     for day_dir in sorted(p for p in detail_root.iterdir() if p.is_dir()):
         raw = load_detail_day(day_dir)
         if not raw:
             continue
-        timeline += flatten_timeline(day_dir.name, raw)
-        snapshots += flatten_snapshots(day_dir.name, raw)
-        for endpoint, change in schema_drift(raw, baseline).items():
-            slot = drift.setdefault(endpoint, {"added": set(), "missing": set()})
-            slot["added"] |= set(change["added"])
-            slot["missing"] |= set(change["missing"])
-    return timeline, snapshots, {e: {k: sorted(v) for k, v in c.items()} for e, c in drift.items()}
+        timeline, snapshots, notes = flatten_day(day_dir.name, raw)
+        yield day_dir.name, timeline, snapshots, notes, raw
+
+
+def detail_tables(detail_root: Path) -> tuple[list[dict], list[dict], dict]:
+    """(timeline, snapshots, drift) for every day under detail_root, all in
+    memory. Fine for a few weeks; garmin_pull streams per day instead."""
+    timeline: list[dict] = []
+    snapshots: list[dict] = []
+    log = DriftLog()
+    for day, t, s, notes, raw in iter_detail_days(detail_root):
+        timeline += t
+        snapshots += s
+        log.add(day, raw, notes)
+    return timeline, snapshots, log.result()

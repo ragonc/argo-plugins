@@ -11,15 +11,20 @@ No other host is ever contacted.
 How login works (Garmin's own protocol, the same one the Connect phone app
 uses): SSO login -> OAuth1 token -> OAuth2 bearer token. After the first
 successful login the tokens are cached in ~/.garmin-pull/session.json
-(chmod 600) and reused, refreshed in place when the access token expires.
-That matters for two reasons: you only type a two-factor code once in a
-long while, and repeated full logins are exactly what triggers Garmin's
-HTTP 429 rate limiting.
+(created 0600, written atomically) and reused. The OAuth2 access token
+lasts about an hour and is re-minted from the OAuth1 token, which Garmin
+keeps valid for roughly a year; so one login, one two-factor code, then
+about a year of pulls without a password on disk. Repeated full logins are
+exactly what triggers Garmin's HTTP 429 rate limiting.
 
-Credentials, in order of precedence:
-  1. GARMIN_USERNAME + GARMIN_PASSWORD in the environment (both required)
+Credentials are only needed for that first login (and again when the
+year-long token dies). garmin_setup.py asks for them in the terminal and
+does not store the password unless you pass --keep-password. When no
+usable session exists the scripts look for credentials in this order:
+  1. GARMIN_USERNAME + GARMIN_PASSWORD in the environment (both required;
+     meant for automation on accounts without two-factor auth)
   2. ~/.garmin-pull/credentials.toml  ->  username = "..." / password = "..."
-     (written for you by garmin_setup.py, chmod 600)
+     (only written by garmin_setup.py --keep-password, 0600)
 Neither the password nor any token is ever printed, logged, or written to
 any output file.
 
@@ -79,7 +84,24 @@ SSO_STATUS_MFA_REQUIRED = "MFA_REQUIRED"
 
 
 class GarminConnectError(Exception):
-    """Base class for everything this module raises."""
+    """Base class for everything this module raises. `status` is the HTTP
+    status when one is known (None for network errors and local problems);
+    `retry_after` is Garmin's Retry-After in seconds when it sent one."""
+
+    def __init__(self, message: str, *, status: int | None = None, retry_after: int | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+    @property
+    def rate_limited(self) -> bool:
+        return self.status == 429
+
+    @property
+    def permanent(self) -> bool:
+        """A 4xx other than 429: the request itself is refused, retrying the
+        same call later will not change the answer."""
+        return self.status is not None and 400 <= self.status < 500 and self.status != 429
 
 
 class GarminConfigError(GarminConnectError):
@@ -107,6 +129,21 @@ class GarminAPIError(GarminConnectError):
     """A connectapi.garmin.com call failed after a successful login."""
 
 
+def _retry_after(headers: dict) -> int | None:
+    for key, value in headers.items():
+        if key.lower() == "retry-after":
+            try:
+                return max(0, int(float(value)))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _http_error(cls, context: str, status: int, headers: dict, body: bytes) -> GarminConnectError:
+    detail = " (rate limited)" if status == 429 else ""
+    return cls(f"{context}: HTTP {status}{detail} {body[:300]!r}", status=status, retry_after=_retry_after(headers))
+
+
 # --- credentials ---------------------------------------------------------
 
 def load_credentials(path: Path = CREDENTIALS_PATH) -> tuple[str, str]:
@@ -128,13 +165,30 @@ def load_credentials(path: Path = CREDENTIALS_PATH) -> tuple[str, str]:
     return str(username), str(password)
 
 
-def save_credentials(username: str, password: str, path: Path = CREDENTIALS_PATH) -> None:
+def _write_private(path: Path, text: str) -> None:
+    """Write `text` to `path` so that it is never readable by other users,
+    not even for an instant: created 0600 under a temporary name in the same
+    directory, then renamed over the target. On Windows the mode bits are
+    ignored (the user's profile folder is private by default there)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    body = f'username = {json.dumps(username)}\npassword = {json.dumps(password)}\n'
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.write(body)
-    os.chmod(path, 0o600)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def save_credentials(username: str, password: str, path: Path = CREDENTIALS_PATH) -> None:
+    _write_private(path, f'username = {json.dumps(username)}\npassword = {json.dumps(password)}\n')
 
 
 # --- OAuth 1.0a request signing (RFC 5849) --------------------------------
@@ -318,38 +372,32 @@ def save_session(session: "GarminSession", path: Path = SESSION_CACHE_PATH) -> N
     """Write `session`'s OAuth1 + OAuth2 tokens to `path` so a later call
     can skip the SSO/MFA login entirely (see load_session()). Overwrites
     any existing cache file at that path -- the whole point is that it
-    reflects the most recent successful login/refresh. chmod 600 after
-    writing, same as every other credential-adjacent output in this
-    project. Raises GarminAuthError if `session` has never logged in;
-    propagates any OSError from the write/chmod itself (caller decides
-    whether a caching failure should be fatal -- main() below treats it as
-    a warning, not a hard failure, since the fetch already succeeded by the
-    time this is called)."""
-    data = _session_cache_dict(session)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    os.chmod(path, 0o600)
+    reflects the most recent successful login/refresh. The file is created
+    0600 and renamed into place, so no other user can read it at any
+    point. Raises GarminAuthError if `session` has never logged in;
+    propagates any OSError from the write itself (caller decides whether a
+    caching failure should be fatal -- the scripts treat it as a warning,
+    since the fetch already succeeded by the time this is called)."""
+    _write_private(path, json.dumps(_session_cache_dict(session), indent=2) + "\n")
 
 
 def load_session(path: Path = SESSION_CACHE_PATH) -> "GarminSession | None":
     """Return a GarminSession restored from a previous save_session() call,
     or None if there's nothing usable to restore. Returns None (never
-    raises) for every one of: no file at `path`; unreadable/corrupt JSON;
-    an unrecognized `cache_version`; a missing expected field; OR a refresh
-    token that has itself expired (`refresh_token_expires_at` in the past --
-    Garmin's hard stop past which only a brand-new SSO login can recover).
-    In every case the cache file itself is left on disk untouched, never
-    deleted here -- this project never deletes without being asked, and a
-    stale/corrupt cache is harmless to leave in place since the next
+    raises) for: no file at `path`; unreadable/corrupt JSON; an
+    unrecognized `cache_version`; a missing expected field. In every case
+    the cache file itself is left on disk untouched, never deleted here --
+    a stale/corrupt cache is harmless to leave in place since the next
     save_session() call overwrites it.
 
-    Deliberately does NOT check whether the OAuth2 *access* token itself
-    (`expires_at`) has expired -- a cached session in that state is exactly
-    the case this caching exists for: GarminSession.connectapi()
-    already refreshes an expired access token lazily and automatically
-    (pre-existing behavior, unchanged by this function) using the OAuth1
-    token restored here, which is a single lightweight request, not a full
-    SSO/MFA round trip."""
+    Deliberately does NOT check either expiry stamp of the OAuth2 token.
+    The access token (`expires_at`, about an hour) is re-minted lazily by
+    GarminSession.connectapi(); and that re-minting uses the OAuth1 token,
+    not the OAuth2 refresh token, so `refresh_token_expires_at` (about a
+    month) says nothing about whether the session is still usable. What
+    actually ends a session is the OAuth1 token, which Garmin keeps valid
+    for roughly a year; the only way to know it died is to try, which
+    open_session() does and falls back to a fresh login."""
     if not path.is_file():
         return None
     try:
@@ -371,9 +419,6 @@ def load_session(path: Path = SESSION_CACHE_PATH) -> "GarminSession | None":
             scope=o2_raw.get("scope", ""),
         )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, AttributeError):
-        return None
-
-    if oauth2_token.refresh_expired:
         return None
 
     session = GarminSession()
@@ -401,6 +446,7 @@ class GarminSession:
         self.oauth1_token: OAuth1Token | None = None
         self.oauth2_token: OAuth2Token | None = None
         self._username: str | None = None  # Garmin Connect "userName", not the login email
+        self.activity_paging_capped = False
 
     # -- low-level request helper --
 
@@ -558,9 +604,7 @@ class GarminSession:
             headers={"User-Agent": OAUTH_USER_AGENT, "Authorization": auth_header},
         )
         if status != 200:
-            raise GarminAuthError(
-                f"OAuth1 preauthorized token request failed: HTTP {status} {body[:300]!r}"
-            )
+            raise _http_error(GarminAuthError, "OAuth1 preauthorized token request failed", status, _headers, body)
         parsed = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8")).items()}
         if "oauth_token" not in parsed or "oauth_token_secret" not in parsed:
             raise GarminAuthError(f"OAuth1 preauthorized response missing token fields: {parsed}")
@@ -596,9 +640,7 @@ class GarminSession:
             form_body=body_params,
         )
         if status != 200:
-            raise GarminAuthError(
-                f"OAuth1->OAuth2 token exchange failed: HTTP {status} {body[:300]!r}"
-            )
+            raise _http_error(GarminAuthError, "OAuth1->OAuth2 token exchange failed", status, _headers, body)
         return _oauth2_token_from_response(self._parse_json(status, body, context="token exchange"))
 
     def refresh_oauth2(self) -> None:
@@ -636,7 +678,7 @@ class GarminSession:
         if status == 204:
             return None
         if status != 200:
-            raise GarminAPIError(f"connectapi {path} failed: HTTP {status} {body[:300]!r}")
+            raise _http_error(GarminAPIError, f"connectapi {path} failed", status, _headers, body)
         try:
             return json.loads(body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -685,7 +727,7 @@ class GarminSession:
         return result if isinstance(result, list) else []
 
     def fetch_activities_since(
-        self, since_date: str, *, page_size: int = 20, max_pages: int = 25
+        self, since_date: str, *, page_size: int = 100, max_pages: int = 1000, pause: float = 0.3
     ) -> list:
         """Page backward through the activity list (newest first, Garmin's
         own order -- never re-sorted here) until an activity's local start
@@ -694,15 +736,16 @@ class GarminSession:
         `max_pages` is hit. The endpoint has no date-range filter of its
         own (confirmed against both reference sources in the module
         docstring -- only start/limit paging), so this is the only way to
-        bound a pull by date. `max_pages` is a safety valve, not an
-        expected limit: 25 * 20 = 500 activities is far more than a daily
-        or weekly catch-up pull should ever need, so hitting it means
-        something is wrong (e.g. `since_date` far in the past) rather than
-        that this many new activities genuinely exist -- the run stops
-        there instead of paging forever."""
+        bound a pull by date. `max_pages` is a safety valve against paging
+        forever, not an expected limit: 1000 * 100 = 100,000 activities.
+        When it is hit, `self.activity_paging_capped` is True so the caller
+        can say so instead of silently returning a truncated list."""
         collected: list = []
         start = 0
-        for _ in range(max_pages):
+        self.activity_paging_capped = False
+        for page_no in range(max_pages):
+            if page_no and pause:
+                time.sleep(pause)
             page = self.fetch_activities(start=start, limit=page_size)
             if not page:
                 break
@@ -716,6 +759,8 @@ class GarminSession:
             if stop or len(page) < page_size:
                 break
             start += page_size
+        else:
+            self.activity_paging_capped = True
         return collected
 
     def fetch_activity_tcx(self, activity_id: int | str) -> bytes:
@@ -737,7 +782,7 @@ class GarminSession:
             headers={"Authorization": self.oauth2_token.authorization_header()},
         )
         if status != 200:
-            raise GarminAPIError(f"connectapi {path} failed: HTTP {status} {body[:300]!r}")
+            raise _http_error(GarminAPIError, f"connectapi {path} failed", status, _headers, body)
         return body
 
 
@@ -920,20 +965,40 @@ def fetch_all(session: GarminSession, day: str) -> dict:
 
 def open_session(*, mfa_code: str | None = None, use_cache: bool = True,
                  cache_path: Path = SESSION_CACHE_PATH, interactive: bool | None = None,
-                 log=None) -> GarminSession:
+                 credentials: tuple[str, str] | None = None, log=None) -> GarminSession:
     """The one call scripts should use: cached session if usable, else a
-    fresh login. Two-factor: uses `mfa_code` if given, otherwise prompts on
-    the terminal when interactive, otherwise raises GarminMFARequired with a
-    clear message. Saves the (possibly refreshed) session on success."""
+    fresh login. A cached session whose access token has expired is
+    refreshed here, up front, so a dead OAuth1 token (about a year old)
+    shows up as a normal login rather than a failure mid-pull. Credentials
+    come from `credentials` (username, password) when given, else from the
+    environment or the credentials file. Two-factor: uses `mfa_code` if
+    given, otherwise prompts on the terminal when interactive, otherwise
+    raises GarminAuthError with a clear message. Saves the session on
+    success."""
     log = log or (lambda msg: print(msg, file=sys.stderr))
     if interactive is None:
         interactive = sys.stdin.isatty()
     if use_cache:
         session = load_session(cache_path)
         if session is not None:
-            log(f"garmin: reusing cached session ({cache_path})")
-            return session
-    username, password = load_credentials()
+            if not session.oauth2_token.expired:
+                log(f"garmin: reusing cached session ({cache_path})")
+                return session
+            try:
+                session.refresh_oauth2()
+            except GarminAuthError as exc:
+                if exc.rate_limited:
+                    raise
+                log("garmin: cached session can no longer be refreshed (the year-long token has "
+                    "expired or was revoked); logging in again")
+            else:
+                log(f"garmin: reusing cached session ({cache_path}), access token refreshed")
+                try:
+                    save_session(session, cache_path)
+                except OSError:
+                    pass
+                return session
+    username, password = credentials or load_credentials()
     session = GarminSession()
     try:
         session.login(username, password, mfa_code=mfa_code)

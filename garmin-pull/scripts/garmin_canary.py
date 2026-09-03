@@ -55,6 +55,9 @@ def assess(summary: dict, status: dict[str, str], timeline: list[dict], drift: d
     if drift:
         parts = []
         for endpoint, change in drift.items():
+            if endpoint == "unmapped":
+                parts.append(f"{len(change)} list(s) not flattened")
+                continue
             if change.get("added"):
                 parts.append(f"{endpoint} +{','.join(change['added'][:4])}")
             if change.get("missing"):
@@ -92,6 +95,16 @@ def run() -> tuple[int, str]:
             pass
 
 
+def valid_webhook(url: str | None) -> str | None:
+    """Only https URLs: the verdict text names your Garmin data shapes and
+    the machine, and must not travel in clear."""
+    if url is None:
+        return None
+    if not url.lower().startswith("https://"):
+        raise SystemExit(f"--webhook must be an https:// URL, not {url[:40]!r}")
+    return url
+
+
 def post_webhook(url: str, text: str) -> bool:
     try:
         body = json.dumps({"content": f"garmin-pull canary: {text}"[:1900]}).encode()
@@ -118,6 +131,16 @@ def _python() -> str:
     return sys.executable or "python3"
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Created 0600 and renamed into place: the unit/plist may carry the
+    webhook URL, which is a secret (anyone holding it can post as you)."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
 def install(webhook: str | None) -> int:
     script = Path(__file__).resolve()
     system = platform.system()
@@ -125,7 +148,7 @@ def install(webhook: str | None) -> int:
     if system == "Linux" and shutil.which("systemctl"):
         unit_dir = Path.home() / ".config" / "systemd" / "user"
         unit_dir.mkdir(parents=True, exist_ok=True)
-        (unit_dir / "garmin-pull-canary.service").write_text(
+        _write_private(unit_dir / "garmin-pull-canary.service",
             "[Unit]\nDescription=garmin-pull weekly check\n\n[Service]\nType=oneshot\n"
             f"{env_line}ExecStart={_python()} {script}\n")
         (unit_dir / "garmin-pull-canary.timer").write_text(
@@ -146,7 +169,7 @@ def install(webhook: str | None) -> int:
         plist = agents / "com.garmin-pull.canary.plist"
         env_xml = (f"<key>EnvironmentVariables</key><dict><key>GARMIN_PULL_WEBHOOK</key>"
                    f"<string>{webhook}</string></dict>" if webhook else "")
-        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+        _write_private(plist, f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.garmin-pull.canary</string>
@@ -202,6 +225,7 @@ def main() -> int:
     parser.add_argument("--install", action="store_true", help="schedule weekly on this machine")
     parser.add_argument("--uninstall", action="store_true", help="remove the schedule")
     args = parser.parse_args()
+    args.webhook = valid_webhook(args.webhook)
     if args.uninstall:
         return uninstall()
     if args.install:

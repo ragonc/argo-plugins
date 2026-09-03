@@ -23,12 +23,14 @@ the rest in one short message with defaults offered:
    - summary (resting heart rate, stress, body battery, steps, calories, intensity minutes)
    - vo2max
    - activities (every workout: distance, duration, heart rate, power, training effect)
-   Default: all five daily summaries. "Just my sleep and HRV" becomes `--what sleep,hrv`.
+   Default: the five daily summaries (`--what summaries`). "Just my sleep and HRV"
+   becomes `--what sleep,hrv`.
    "Everything the watch recorded", "all data points", "the intraday data" means
    `--full-day`: the summaries plus every timestamped measurement of each day (heart
    rate, stress, body battery, steps, breathing, SpO2, HRV, sleep stages) and the day's
    readiness, hydration, training status, endurance and fitness age, plus workout
    files. About four times the cost of the summaries; say so for long ranges.
+   `--full-day --what sleep` keeps their choice and adds `detail` to it.
 2. **Which period.** Default: last 30 days (`--last 30d`; also `12w`, `6m`, `2y`, or
    `--since`/`--until` dates). "All my history" means `--all-history`: from their first
    Garmin activity to today. Warn that it is long (often over an hour, in two or three
@@ -50,8 +52,9 @@ because it asks for their Garmin email and password privately:
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/garmin_setup.py
 ```
 
-Explain in one line what it does: stores the login on their computer only, readable
-only by them, logs in once, and may ask for a two-factor code that Garmin emails them.
+Explain in one line what it does: logs in once in their terminal, keeps only the
+session on their computer (readable only by them, good for about a year, the
+password is not stored), and may ask for a two-factor code that Garmin emails them.
 Wait until they say it worked, then run the doctor again. Do not try to run the setup
 for them and do not ask them to paste the password into the chat.
 
@@ -114,15 +117,21 @@ feature is not on their device. Say that rather than guessing.
 
 ## Things that go wrong
 
-- **"two-factor code needed but no terminal to ask on"**: the session expired. They
-  run the setup script again in their terminal.
-- **HTTP 429**: throttled, see above. Repeated full logins cause it, which is why the
-  session is cached; never add `--no-cache` to work around a problem.
+- **"two-factor code needed but no terminal to ask on"** or **"not logged in yet"**:
+  the year-long session expired or was never made. They run the setup script again
+  in their terminal.
+- **HTTP 429**: throttled, see above. The script already waits once when Garmin asks
+  for two minutes or less; a longer wait is printed. Repeated full logins cause it,
+  which is why the session is cached; never add `--no-cache` to work around a problem.
+- **"Not flattened" lines in the report**: a list had several numeric columns and no
+  name saying which is the value, so it was left out rather than guessed. The raw
+  JSON under `raw/detail/<day>/` has it.
 - **A field is always empty**: check the report's drift section first. Summary columns
   are mapped in `garmin_client.py`; detail is flattened generically from the raw JSON
   under `raw/detail/<day>/`, so read that to see what Garmin actually sent.
 - **Anything odd**: `garmin_doctor.py` first, then the report, then the raw JSON.
-- **Wrong Python**: the scripts need 3.11+. `python3 --version` tells them.
+- **Wrong Python**: the scripts need 3.11+. `python3 --version` tells them; macOS:
+  `brew install python@3.11`, Windows: the python.org installer with "Add to PATH".
 
 ## Never
 

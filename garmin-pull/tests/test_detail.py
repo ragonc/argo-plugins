@@ -141,6 +141,140 @@ class TestAdaptsToChangedShapes(unittest.TestCase):
             self.assertEqual(gd.flatten_endpoint(DAY, "heart_rate", bad)[0], [])
 
 
+class TestNeverGuessesTheValueColumn(unittest.TestCase):
+    def test_two_numeric_columns_without_a_value_name_are_left_out_and_reported(self):
+        raw = {"thingValues": [[1788300000000, 5, 9]],
+               "thingValueDescriptors": [{"index": 0, "key": "timestamp"}, {"index": 1, "key": "alpha"},
+                                         {"index": 2, "key": "beta"}]}
+        notes = []
+        rows = gd.flatten_endpoint(DAY, "stress", raw, notes)[0]
+        self.assertEqual(rows, [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("stress.thingValues", notes[0])
+        self.assertIn("alpha, beta", notes[0])
+
+    def test_one_numeric_column_is_still_taken_without_a_value_name(self):
+        raw = {"thingValues": [[1788300000000, "MEASURED", 7]],
+               "thingValueDescriptors": [{"index": 0, "key": "timestamp"}, {"index": 1, "key": "kind"},
+                                         {"index": 2, "key": "zeta"}]}
+        rows = gd.flatten_endpoint(DAY, "stress", raw)[0]
+        self.assertEqual((rows[0]["value"], rows[0]["value2"]), (7, "MEASURED"))
+
+    def test_no_descriptors_and_two_numbers_is_ambiguous(self):
+        notes = []
+        rows = gd.flatten_endpoint(DAY, "heart_rate", {"heartRateValues": [[1788300000000, 60, 70]]}, notes)[0]
+        self.assertEqual(rows, [])
+        self.assertTrue(notes and "no descriptors" in notes[0])
+
+    def test_dict_list_with_two_unknown_numbers_is_left_out(self):
+        items = [{"startGMT": "2026-09-01T21:15:50.0", "foo": 1, "bar": 2}]
+        notes = []
+        self.assertEqual(gd.flatten_endpoint(DAY, "sleep", {"newList": items}, notes)[0], [])
+        self.assertIn("sleep.newList", notes[0])
+
+    def test_dict_list_with_one_unknown_number_is_taken(self):
+        items = [{"startGMT": "2026-09-01T21:15:50.0", "foo": 1, "label": "x"}]
+        rows = gd.flatten_endpoint(DAY, "sleep", {"newList": items})[0]
+        self.assertEqual((rows[0]["value"], rows[0]["value2"]), (1, "x"))
+
+    def test_flatten_day_collects_notes_once_per_endpoint(self):
+        raw = {"heart_rate": {"heartRateValues": [[1788300000000, 60, 70]]}, "hydration": {"valueInML": 3}}
+        timeline, snapshots, notes = gd.flatten_day(DAY, raw)
+        self.assertEqual(timeline, [])
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(snapshots[0]["metric"], "hydration_ml")
+
+
+class TestPerDeviceSnapshots(unittest.TestCase):
+    TWO = {"mostRecentTrainingStatus": {"latestTrainingStatusData": {
+        "111": {"trainingStatusFeedbackPhrase": "MAINTAINING_2", "weeklyTrainingLoad": 473, "primaryTrainingDevice": False},
+        "222": {"trainingStatusFeedbackPhrase": "PRODUCTIVE_1", "weeklyTrainingLoad": 512, "primaryTrainingDevice": True}}}}
+
+    def test_primary_device_keeps_the_plain_name_and_the_other_gets_its_id(self):
+        snap = {r["metric"]: r["value"] for r in gd.flatten_endpoint(DAY, "training_status", self.TWO)[1]}
+        self.assertEqual(snap["training_status"], "PRODUCTIVE_1")
+        self.assertEqual(snap["training_load_7d"], 512)
+        self.assertEqual(snap["training_status_device_111_weekly_training_load"], 473)
+        self.assertEqual(snap["training_status_device_111_training_status_feedback_phrase"], "MAINTAINING_2")
+
+    def test_first_device_is_primary_when_none_is_flagged(self):
+        raw = {"latestTrainingStatusData": {"5": {"weeklyTrainingLoad": 1}, "6": {"weeklyTrainingLoad": 2}}}
+        snap = {r["metric"]: r["value"] for r in gd.flatten_endpoint(DAY, "training_status", raw)[1]}
+        self.assertEqual(snap["training_status_latest_training_status_data_by_device_weekly_training_load"], 1)
+        self.assertEqual(snap["training_status_latest_training_status_data_device_6_weekly_training_load"], 2)
+
+    def test_single_device_is_unchanged(self):
+        snap = {r["metric"]: r["value"] for r in gd.flatten_endpoint(DAY, "training_status", RAW["training_status"])[1]}
+        self.assertEqual(snap["training_load_7d"], 473)
+
+
+class TestAliasTables(unittest.TestCase):
+    def test_friendly_names_are_unique(self):
+        series = list(gd.SERIES_ALIASES.values())
+        self.assertEqual(len(series), len(set(series)))
+        metrics = list(gd.METRIC_ALIASES.values())
+        self.assertEqual(len(metrics), len(set(metrics)))
+        # a friendly metric name must not collide with a prefix-shortened generated name
+        shortened = {short for _, short in gd.PREFIX_ALIASES}
+        self.assertFalse(set(metrics) & shortened)
+
+
+class _StubSession:
+    """Stands in for GarminSession in fetch_detail: answers per endpoint name."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    def _garmin_username(self):
+        return "u"
+
+    def connectapi(self, path, *, params=None):
+        self.calls.append(path)
+        for name, (path_fn, _) in gd.ENDPOINTS.items():
+            if path_fn(DAY, "u") == path:
+                answer = self.answers.get(name, {"ok": 1})
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        raise AssertionError(path)
+
+
+class TestFetchDetailStatuses(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self._tmp.name) / DAY
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_4xx_is_final_and_not_asked_again(self):
+        from garmin_client import GarminAPIError
+        session = _StubSession({"fitness_age": GarminAPIError("HTTP 404", status=404),
+                                "spo2": GarminAPIError("HTTP 500", status=500)})
+        status = gd.fetch_detail(session, DAY, self.out, pause=0)
+        self.assertTrue(status["fitness_age"].startswith("none"))
+        self.assertTrue(status["spo2"].startswith("error"))
+        self.assertFalse(gd.detail_complete(self.out))
+        # next run: only the 5xx endpoint is retried, the 404 is remembered
+        session.answers["spo2"] = {"averageSpO2": 93}
+        session.calls.clear()
+        status = gd.fetch_detail(session, DAY, self.out, pause=0)
+        self.assertEqual(session.calls, [gd.ENDPOINTS["spo2"][0](DAY, "u")])
+        self.assertEqual(status["spo2"], "ok")
+        self.assertTrue(status["fitness_age"].startswith("none"))
+        self.assertTrue(gd.detail_complete(self.out))
+
+    def test_rate_limit_saves_progress_and_raises(self):
+        from garmin_client import GarminAPIError
+        session = _StubSession({"steps": GarminAPIError("HTTP 429", status=429, retry_after=30)})
+        with self.assertRaises(GarminAPIError):
+            gd.fetch_detail(session, DAY, self.out, pause=0)
+        index = json.loads((self.out / "_index.json").read_text())
+        self.assertEqual(index["heart_rate"], "ok")
+        self.assertNotIn("steps", index)
+
+
 class TestSnapshots(unittest.TestCase):
     def test_metrics_and_aliases(self):
         snap = {r["metric"]: r["value"] for r in gd.flatten_snapshots(DAY, RAW)}
